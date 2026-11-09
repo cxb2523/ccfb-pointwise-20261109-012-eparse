@@ -13,12 +13,18 @@ import click
 import pandas as pd
 
 from .core import (
+    InvalidFilterPattern,
     df_find_tables,
     df_normalize_data,
     df_serialize_table,
     get_df_from_file,
+    validate_table_filters,
+    write_serialized_records,
 )
 from .interfaces import ExcelParse, i_factory
+
+FILE_OUTPUT_SUFFIXES = (".json", ".csv")
+URI_SCHEMES = ("null", "stdout", "sqlite3", "postgres", "html")
 
 
 def handle(e, exceptions=None, msg=None, debug=False, exit=True):
@@ -139,6 +145,12 @@ def main(
 
     # get input and output objects
     for t in ("input", "output"):
+        # a plain json/csv file path is handled by the parse command's
+        # file exporter rather than the URI-based interfaces below
+        if t == "output" and Path(ctx.obj[t]).suffix.lower() in FILE_OUTPUT_SUFFIXES:
+            ctx.obj[f"{t}_obj"] = None
+            continue
+
         try:
             ctx.obj[f"{t}_obj"] = i_factory(ctx.obj[t], ExcelParse)
         except ValueError as e:
@@ -276,7 +288,36 @@ def scan(ctx, number, sheet, tables):
     default=False,
     help="exclude nested tables from output (only top-level tables)",
 )
-def parse(ctx, sheet, serialize, table, nacount, exclude_nested):
+@click.option(
+    "--sheet-filter",
+    type=str,
+    default=None,
+    help="regex applied to sheet names; only matching tables are kept",
+)
+@click.option(
+    "--range-filter",
+    type=str,
+    default=None,
+    help="regex applied to each table's excel range (e.g. 'A1:B3')",
+)
+@click.option(
+    "--type",
+    "output_type",
+    type=click.Choice(["json", "csv"]),
+    default=None,
+    help="write filtered tables to --output as json or csv",
+)
+def parse(
+    ctx,
+    sheet,
+    serialize,
+    table,
+    nacount,
+    exclude_nested,
+    sheet_filter,
+    range_filter,
+    output_type,
+):
     """
     parse table(s) found in sheet for target(s)
     """
@@ -286,9 +327,30 @@ def parse(ctx, sheet, serialize, table, nacount, exclude_nested):
     ctx.obj["table"] = table
     ctx.obj["na_tolerance_r"] = nacount + 1
     ctx.obj["na_tolerance_c"] = nacount + 1
+    ctx.obj["sheet_filter"] = sheet_filter
+    ctx.obj["range_filter"] = range_filter
+    ctx.obj["output_type"] = output_type
 
     if ctx.obj["debug"]:
         PrettyPrinter().pprint(ctx.obj)
+
+    # fail fast with a clear, non-zero exit on bad filter patterns instead
+    # of leaking a traceback or silently skipping the filter per file
+    try:
+        validate_table_filters(sheet_filter, range_filter)
+    except InvalidFilterPattern as e:
+        handle(e, msg=f"filter error - {e}", debug=ctx.obj["debug"])
+
+    if output_type is not None:
+        output = ctx.obj["output"]
+        if output.split("://")[0] in URI_SCHEMES:
+            handle(
+                ValueError("a file path is required"),
+                msg=f"--type requires a file path via --output, got {output!r}",
+                debug=ctx.obj["debug"],
+            )
+
+    records = []
 
     for f in ctx.obj["files"]:
         if f.is_file() and "xls" in f.name:
@@ -308,13 +370,15 @@ def parse(ctx, sheet, serialize, table, nacount, exclude_nested):
                     ctx.obj["na_tolerance_r"],
                     ctx.obj["na_tolerance_c"],
                     exclude_nested=exclude_nested,
+                    sheet_filter=sheet_filter,
+                    range_filter=range_filter,
                 ):
                     if ctx.obj["verbose"]:
                         m = "{} table {} {} found at {} in {}"
                         v = (f.name, name, output.shape, excel_RC, s)
                         print(m.format(*v))
 
-                    if serialize:
+                    if serialize or output_type:
                         output = df_serialize_table(
                             output,
                             name=name,
@@ -324,6 +388,10 @@ def parse(ctx, sheet, serialize, table, nacount, exclude_nested):
 
                     if ctx.obj["debug"]:
                         PrettyPrinter().pprint(output)
+
+                    if output_type:
+                        records.extend(output)
+                        continue
 
                     try:
                         ctx.obj["output_obj"].output(output, ctx)
@@ -336,6 +404,13 @@ def parse(ctx, sheet, serialize, table, nacount, exclude_nested):
                 msg = f"skipping {f} - {e}"
                 handle(e, msg=msg, debug=ctx.obj["debug"], exit=False)
                 continue
+
+    if output_type:
+        try:
+            write_serialized_records(records, ctx.obj["output"], output_type)
+        except Exception as e:
+            msg = f'output to {ctx.obj["output"]} failed - {e}'
+            handle(e, msg=msg, debug=ctx.obj["debug"])
 
 
 @main.command()

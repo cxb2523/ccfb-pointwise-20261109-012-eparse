@@ -4,6 +4,9 @@
 excel parser core module
 """
 
+import csv
+import json
+import re
 from io import StringIO
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -11,6 +14,42 @@ import pandas as pd
 from openpyxl.utils.cell import get_column_letter
 
 TableRef = Tuple[int, int, str, str]  # r, c, excel RC, value
+
+
+class InvalidFilterPattern(ValueError):
+    """
+    raised when a sheet_filter or range_filter regex fails to compile
+    """
+
+
+def _compile_filter(pattern: Optional[str], label: str) -> Optional[re.Pattern]:
+    """
+    compile a filter regex, raising InvalidFilterPattern on bad input
+    """
+
+    if not pattern:
+        return None
+
+    try:
+        return re.compile(pattern)
+    except re.error as e:
+        raise InvalidFilterPattern(f"invalid {label} pattern {pattern!r} - {e}") from e
+
+
+def validate_table_filters(
+    sheet_filter: Optional[str] = None,
+    range_filter: Optional[str] = None,
+) -> Tuple[Optional[re.Pattern], Optional[re.Pattern]]:
+    """
+    compile and validate sheet_filter and range_filter patterns
+
+    raises InvalidFilterPattern if either pattern fails to compile
+    """
+
+    return (
+        _compile_filter(sheet_filter, "sheet_filter"),
+        _compile_filter(range_filter, "range_filter"),
+    )
 
 
 # NOTE: df[n] df.at[r,c] and df.iloc[r,c] are not all the same
@@ -22,10 +61,22 @@ TableRef = Tuple[int, int, str, str]  # r, c, excel RC, value
 def df_find_tables(
     df: pd.DataFrame,
     loose: bool = False,
+    sheet_filter: Optional[str] = None,
+    range_filter: Optional[str] = None,
+    sheet_name: Optional[str] = None,
 ) -> List[TableRef]:
     """
     finds table corners in a dataframe
+
+    sheet_filter and range_filter are regexes applied per discovered table
+    (not to the sheet as a whole), since a single sheet can contain multiple
+    non-adjacent tables that must be included/excluded independently.
+    sheet_filter is matched against sheet_name and range_filter against the
+    table's full excel range (e.g. "A1:B3"). when both are given, a table
+    must match both (intersection) to be kept.
     """
+
+    sheet_re, range_re = validate_table_filters(sheet_filter, range_filter)
 
     result = []
 
@@ -74,7 +125,28 @@ def df_find_tables(
                     )
                 )
 
-    return result
+    if sheet_re is None and range_re is None:
+        return result
+
+    filtered = []
+
+    for r, c, excel_RC, name in result:
+        if sheet_re is not None:
+            if sheet_name is None or not sheet_re.search(sheet_name):
+                continue
+
+        if range_re is not None:
+            r_start, r_end, c_start, c_end = _get_table_bounds(df, r, c)
+            full_range = (
+                f"{get_column_letter(c_start+1)}{r_start+1}"
+                f":{get_column_letter(c_end)}{r_end}"
+            )
+            if not range_re.search(full_range):
+                continue
+
+        filtered.append((r, c, excel_RC, name))
+
+    return filtered
 
 
 def _get_table_bounds(df: pd.DataFrame, r: int, c: int) -> Tuple[int, int, int, int]:
@@ -305,6 +377,32 @@ def df_serialize_table(
     return result
 
 
+def write_serialized_records(
+    records: List[Dict],
+    path: str,
+    output_type: str,
+) -> None:
+    """
+    write serialized table records (df_serialize_table convention) to a
+    json or csv file; this is the same flat, one-row-per-cell record shape
+    used by the database interfaces, so multi-table exports share a single
+    header/row convention instead of a per-table layout
+    """
+
+    if output_type == "json":
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(records, fh, default=str)
+    elif output_type == "csv":
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            if not records:
+                return
+            writer = csv.DictWriter(fh, fieldnames=list(records[0].keys()))
+            writer.writeheader()
+            writer.writerows(records)
+    else:
+        raise ValueError(f"unsupported output type {output_type!r}")
+
+
 def get_df_from_file(
     io: Any,
     loose: bool = True,
@@ -314,10 +412,15 @@ def get_df_from_file(
     na_tolerance_c: int = 1,
     na_strip: bool = True,
     exclude_nested: bool = False,
+    sheet_filter: Optional[str] = None,
+    range_filter: Optional[str] = None,
 ):
     """
     helper function to yield tables from a file
     """
+
+    # fail fast on bad patterns before reading any files
+    validate_table_filters(sheet_filter, range_filter)
 
     f = pd.read_excel(
         io,
@@ -331,7 +434,13 @@ def get_df_from_file(
         f = {s: f for s in sheet}
 
     for s in f.keys():
-        tables = df_find_tables(f[s], loose)
+        tables = df_find_tables(
+            f[s],
+            loose,
+            sheet_filter=sheet_filter,
+            range_filter=range_filter,
+            sheet_name=s,
+        )
 
         # apply nested table filter if enabled
         if exclude_nested:

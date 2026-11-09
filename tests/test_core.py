@@ -6,7 +6,10 @@ unit tests for eparse core
 
 import pandas as pd
 
+import pytest
+
 from eparse.core import (
+    InvalidFilterPattern,
     df_find_tables,
     df_parse_table,
     df_serialize_table,
@@ -18,6 +21,17 @@ from eparse.core import (
     _is_inside_bounds,
     _filter_nested_tables,
 )
+
+MULTI_SHEET_FIXTURE = "tests/files/multi_sheet_tables.xlsx"
+
+
+def _parse(**kwargs):
+    return [
+        (s, excel_RC, name)
+        for _, excel_RC, name, s in get_df_from_file(
+            MULTI_SHEET_FIXTURE, loose=True, **kwargs
+        )
+    ]
 
 
 def test_df_find_tables(xlsx):
@@ -31,6 +45,51 @@ def test_df_find_tables_loose(xlsx):
     assert len(t) == 10
     assert (2, 2, "C3", "ID") in t
     assert (102, 2, "C103", "Schedule of Principal Repayments:") in t
+
+
+def test_sheet_filter_only():
+    result = _parse(sheet_filter="Sheet[12]")
+    assert sorted(result) == sorted(
+        [
+            ("Sheet1", "A1", "ID"),
+            ("Sheet1", "A10", "Code"),
+            ("Sheet2", "A1", "Key"),
+        ]
+    )
+
+
+def test_range_filter_only():
+    result = _parse(range_filter="A1:.*")
+    assert sorted(result) == sorted(
+        [
+            ("Sheet1", "A1", "ID"),
+            ("Sheet2", "A1", "Key"),
+            ("Sheet3", "A1", "Foo"),
+        ]
+    )
+
+
+def test_sheet_and_range_filter_intersection():
+    result = _parse(sheet_filter="Sheet[12]", range_filter="A1:.*")
+    assert sorted(result) == sorted(
+        [
+            ("Sheet1", "A1", "ID"),
+            ("Sheet2", "A1", "Key"),
+        ]
+    )
+
+
+def test_sheet_and_range_filter_empty_intersection():
+    result = _parse(sheet_filter="Sheet3", range_filter="A10:.*")
+    assert result == []
+
+
+def test_invalid_filter_pattern_raises():
+    with pytest.raises(InvalidFilterPattern):
+        _parse(sheet_filter="[")
+
+    with pytest.raises(InvalidFilterPattern):
+        _parse(range_filter="[")
 
 
 def test_df_parse_table(xlsx):
